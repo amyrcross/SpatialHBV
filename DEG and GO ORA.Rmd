@@ -1,0 +1,986 @@
+---
+title: "Differential gene expression"
+author: "Amy Cross"
+date: "2024-01-19"
+output: html_document
+---
+
+### Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ComplexHeatmap)
+library(tidyverse)
+library(openxlsx)
+
+library(limma)
+library(Biobase)
+library(statmod)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+library(ggrepel)
+
+#Set the working directory
+knitr::opts_knit$set(root.dir = "E:/Projects and TRIG work/Collaborations and assorted DSP projects/HBV and HIV Peppa Dimitra DSP/Github repo")
+```
+
+
+### Import data
+
+```{r import data, echo=F}
+#Quantile normalised and filtered data produced by QC Rmd.
+filt_norm_data <- read.csv("Output/Quantile_genes.csv", row.names = 1, check.names = F)
+
+#ROI annotations
+group_annot <- read.xlsx("Data/ROI annotations.xlsx", sheet = "ROI metadata")
+
+#gene annotations
+gene_annot <- read.xlsx("Reference/Gene symbols and Entrez ID for detectable transcripts.xlsx", sheet = "Gene symbols and Entrez ID for ")
+
+```
+
+
+### Volcano plot functions
+
+```{r volcano function nonadj, include=FALSE, echo=F}
+nonadj_volc_plot <- function(import_data, subgroup, comparison1, comparison2, colour1, colour2,maxy,maxx, overlaps){
+
+#import_data <- res
+#subgroup <- 
+#comparison1 <- "+"
+#comparison2 <- "-"
+#colour1 <- "red"
+#colour2 <- "blue"
+
+  x <- ggplot(data=import_data) +
+    geom_point(data = subset(import_data, logFC > log2(1.5) & P.Value < 0.05), aes(x = logFC, y=-log10(P.Value)), color = colour1, size=3) +
+    #Plot all genes above log2 FC and p value threshold (upregulated) in red
+    geom_point(data = subset(import_data, logFC < log2(1.5) & P.Value < 0.05), aes(x = logFC, y=-log10(P.Value)), color = colour2, size=3) +
+    #Plot all genes below log2 FC and p value threshold (downregulated) in blue
+    geom_point(data = subset(import_data, logFC < log2(1.5) & logFC > -log2(1.5)), aes(x = logFC, y=-log10(P.Value)), color = "grey", size=3) +
+    geom_point(data = subset(import_data, P.Value > 0.05), aes(x = logFC, y=-log10(P.Value)), color = "grey", size=3) +
+    #Plot all other genes that did not meet the thresholds in grey
+    geom_text_repel(aes(x = logFC, y=-log10(P.Value), label = ifelse(P.Value < 0.05 & (logFC > log2(1.5) | logFC < -log2(1.5)), rownames(import_data),"")), max.overlaps = overlaps, segment.color= NA, size=2) +
+    #USe geom_text_repel to label the points in an aesthetically decent way.  Ifelse means only thresholded genes are labelled. Infinite overlaps ensures all overlaps are allowed.  Segment colour = NA removes all segments. 
+    theme(panel.background = element_rect(fill = "white"), 
+          panel.grid.major = element_blank(), 
+          panel.border= element_rect(colour="black", fill=NA), 
+          axis.text = element_text(size = 12),
+          axis.title = element_text(hjust = 0.5, size = 16), #face="bold",
+          plot.title = element_text(size = 16, hjust = 0.5, face = "bold")) + 
+    #geom_vline(xintercept = 0, linetype = 1, color = "grey60") +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, color = "grey20") +
+    geom_hline(yintercept = -log10(0.01), linetype = 3, color = "grey20") +
+    geom_hline(yintercept = -log10(0.001), linetype = 3, color = "grey20") +
+    #geom_hline(yintercept = -log10(0.1), linetype = 2, color = "grey60") +
+    scale_x_continuous(limits = c(-maxx,maxx)) +
+    scale_y_continuous(limits=c(0,maxy))+
+    #geom_text(aes(-3,-log10(0.05), label = "0.05", vjust=1.5), color = "grey20", size = 4) +
+    #geom_text(aes(-3,-log10(0.1), label = "0.1", vjust=1.5), color = "grey60", size = 4) +  
+    xlab("Log2 Fold Change") +
+    ylab("-log10(P.Value)") +
+    ggtitle(paste0(subgroup, ": ", comparison1," vs. ", comparison2))
+   
+  x
+}
+```
+
+```{r volcano function adj, include=FALSE, echo=F}
+adj_volc_plot <- function(import_data, subgroup, comparison1, comparison2, colour1, colour2,maxy,maxx,overlaps){
+
+#import_data <- res
+#subgroup <- 
+#comparison1 <- "+"
+#comparison2 <- "-"
+#colour1 <- "red"
+#colour2 <- "blue"
+
+x <-   ggplot(data=import_data) +
+    geom_point(data = subset(import_data, logFC > log2(1.5) & adj.P.Val < 0.05), aes(x = logFC, y=-log10(adj.P.Val)), color = colour1, size=3) +
+    #Plot all genes above log2 FC and p value threshold (upregulated) in red
+    geom_point(data = subset(import_data, logFC < log2(1.5) & adj.P.Val < 0.05), aes(x = logFC, y=-log10(adj.P.Val)), color = colour2, size=3) +
+    #Plot all genes below log2 FC and p value threshold (downregulated) in blue
+    geom_point(data = subset(import_data, logFC < log2(1.5) & logFC > -log2(1.5)), aes(x = logFC, y=-log10(adj.P.Val)), color = "grey", size=3) +
+    geom_point(data = subset(import_data, adj.P.Val > 0.05), aes(x = logFC, y=-log10(adj.P.Val)), color = "grey", size=3) +
+    #Plot all other genes that did not meet the thresholds in grey
+    geom_text_repel(aes(x = logFC, y=-log10(adj.P.Val), label = ifelse(adj.P.Val < 0.05 & (logFC > log2(1.5) | logFC < -log2(1.5)), rownames(import_data),"")), max.overlaps = overlaps , segment.color= NA, size=2) +
+    #USe geom_text_repel to label the points in an aesthetically decent way.  Ifelse means only thresholded genes are labelled. Infinite overlaps ensures all overlaps are allowed.  Segment colour = NA removes all segments. 
+    theme(panel.background = element_rect(fill = "white"), 
+          panel.grid.major = element_blank(), 
+          panel.border= element_rect(colour="black", fill=NA), 
+          axis.text = element_text(size = 12),
+          axis.title = element_text(hjust = 0.5, size = 16), #face="bold",
+          plot.title = element_text(size = 16, hjust = 0.5, face = "bold")) + 
+    #geom_vline(xintercept = 0, linetype = 1, color = "grey60") +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, color = "grey20") +
+    geom_hline(yintercept = -log10(0.01), linetype = 3, color = "grey20") +
+    geom_hline(yintercept = -log10(0.001), linetype = 4, color = "grey20") +
+    #geom_hline(yintercept = -log10(0.1), linetype = 2, color = "grey60") +
+    scale_x_continuous(limits = c(-maxx,maxx)) +
+    scale_y_continuous(limits=c(0,maxy))+
+    #geom_text(aes(-3,-log10(0.05), label = "0.05", vjust=1.5), color = "grey20", size = 4) +
+    #geom_text(aes(-3,-log10(0.1), label = "0.1", vjust=1.5), color = "grey60", size = 4) +  
+    xlab("Log2 Fold Change") +
+    ylab("-log10(Adj.P.Value)") +
+    ggtitle(paste0(subgroup, ": ", comparison1," vs. ", comparison2))
+   
+  x
+}
+```
+
+
+
+### Co-infection (PT3)_immune high (A) vs immune low (B)
+
+  A: 30-80% Immune and 80-100% HBV
+  B: 2-10% Immune and 80-100% HBV
+
+```{r DEG PT3 immune high and low, echo=F}
+# refine datasets
+group_annot_temp <-group_annot[group_annot$Patient == "PT3",]
+
+filt_norm_data_temp <- filt_norm_data[,25:37]
+
+### New for aesthetics
+group_annot_temp$Condensed.groups[group_annot_temp$Condensed.groups == "A"] <- "HighImmune"
+group_annot_temp$Condensed.groups[group_annot_temp$Condensed.groups == "B"] <- "FewImmune"
+
+x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="HighImmune" | group_annot_temp$Condensed.groups == "FewImmune"]
+y <- group_annot_temp[group_annot_temp$Condensed.groups =="HighImmune" | group_annot_temp$Condensed.groups == "FewImmune",]
+
+# make the expression set
+eset <- ExpressionSet(log2(as.matrix(x)))
+
+# define the factors that we want to model
+condition <- factor(y$Condensed.groups)
+
+# specify the design
+design <- model.matrix(~condition)
+
+# fit the linear model
+fit <- lmFit(eset, design)
+
+# run the DE analysis
+fit <- eBayes(fit, 
+              trend=TRUE, 
+              robust=TRUE, 
+              proportion = 0.01) #trend and robust make little difference.
+
+# extract the results
+res <- topTable(fit, coef="conditionHighImmune",n=Inf)
+res$gene <- rownames(res)
+
+#Calculate number of DEG
+sig_genes <- subset(res, adj.P.Val<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of FDR signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+sig_genes <- subset(res, P.Value<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of unadjusted signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+```
+If res requires the condition (e.g. conditionB) then it will be the positive log2FC.
+In this case, it is conditionB.
+
+```{r extract DEG and make volcano plot PT3, fig.width=6, fig.height=6, fig.cap="GO.BP pathways analysis", echo=FALSE, echo=F}
+#Retrieve volcano plots of DEG results
+adj_volc_plot(res, "PT3", "5% CD45+", "50% CD45+", "#CC0066", "grey30",14,4,20)
+#af <- nonadj_volc_plot(res, "PT3", "5% CD45+", "50% CD45+", "#CC0066", "grey30",18,4,17)
+
+# 1. Need the CTA_display_names to correspond to Entrez ID
+all_DEG <- res
+
+all_DEG$SYMBOL <- rownames(all_DEG)
+
+all_DEG_entrez <- merge(all_DEG, gene_annot, by = "SYMBOL")
+
+write.csv(all_DEG_entrez, file = "Output/DEG of PT3_A vs B_High vs Low immune.csv")
+```
+
+If res requires the condition (e.g. conditionB) then it will be the positive log2FC.
+In this case, it is conditionB.
+  A: 30-80% Immune and 80-100% HBV
+  B: 2-10% Immune and 80-100% HBV
+
+```{r, echo=F}
+# 2. Extract the DEG (P<0.05 and FC > 1.5)
+#sig_genes <- subset(all_DEG_entrez, adj.P.Val<=0.05) 
+sig_genes <- subset(all_DEG_entrez, P.Value <=0.05)
+
+A_genes <- subset(sig_genes, logFC <= -log2(1.5)) #High immune
+B_genes <- subset(sig_genes, logFC >= log2(1.5)) #Low immune
+
+# 3. Need the background in Entrez ID
+galaxy <- subset(all_DEG_entrez, !is.na(all_DEG_entrez$ENTREZID)) 
+ 
+#----Create enrichGO object for High immune genes
+A <- enrichGO(gene = as.character(A_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+barplot(A, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "",
+        font.size = 8)
+
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.csv(x, file = "Output/Pathways in co-infection_PT3_A vs B_A_highImmune.csv")
+
+#----Create enrichGO object for low immune
+B <- enrichGO(gene = as.character(B_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+barplot(B, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "",
+        font.size = 8) 
+
+x <- as.data.frame(B$Description)
+x <- cbind(x,B$GeneRatio)
+x <- cbind(x, B$p.adjust)
+x <- cbind(x, B$geneID)
+
+#write.csv(x, file = "Output/Pathways in co-infection_PT3_A vs B_B_lowImmune.csv")
+```
+
+```{r fig.width=6, fig.height=6, echo=F}
+top <- c(2,15,18,22, 23, 24, 34, 62, 66, 68) 
+
+top_names <- B$Description[top] 
+
+dotplot(B,
+        showCategory = top_names,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: PT3") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 10),
+              plot.title = element_text(size = 10, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 10),
+              legend.text = element_text(size = 10)) +
+        scale_color_gradient(low = "#CC0066", high = "grey80")
+
+```
+
+### Low fibrosis (PT1)_HBV high (D) vs HBV low (E)
+
+  C: 2-10% Immune and 80-100% HBV
+  D: 0 Immune and 80-100% HBV
+  E: 0 Immune and 0% HBV 
+  
+```{r DEG PT1 HBV high and low, fig.width=6, fig.height=6, echo=F}
+# refine datasets
+group_annot_temp <-group_annot[group_annot$Patient == "PT1",]
+
+filt_norm_data_temp <- filt_norm_data[,13:24]
+
+### New for aesthetics
+group_annot_temp$Condensed.groups[group_annot_temp$Condensed.groups == "D"] <- "HighHBV"
+group_annot_temp$Condensed.groups[group_annot_temp$Condensed.groups == "E"] <- "FewHBV"
+
+x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="HighHBV" | group_annot_temp$Condensed.groups == "FewHBV"]
+y <- group_annot_temp[group_annot_temp$Condensed.groups =="HighHBV" | group_annot_temp$Condensed.groups == "FewHBV",]
+
+#x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="D" | group_annot_temp$Condensed.groups == "E"]
+#y <- group_annot_temp[group_annot_temp$Condensed.groups =="D" | group_annot_temp$Condensed.groups == "E",]
+
+# make the expression set
+eset <- ExpressionSet(log2(as.matrix(x)))
+
+# define the factors that we want to model
+condition <- factor(y$Condensed.groups)
+
+# specify the design
+design <- model.matrix(~condition)
+
+# fit the linear model
+fit <- lmFit(eset, design)
+
+# run the DE analysis
+fit <- eBayes(fit, 
+              trend=TRUE, 
+              robust=TRUE, 
+              proportion = 0.01) # trend and robust make little difference.
+
+# extract the results
+res <- topTable(fit, coef="conditionHighHBV",n=Inf)
+res$gene <- rownames(res)
+
+#Calculate number of DEG
+sig_genes <- subset(res, adj.P.Val<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of FDR signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+sig_genes <- subset(res, P.Value<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of unadjusted signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+```
+
+```{r fig.height=6, fig.width=6, echo=F}
+#Retrieve volcano plots of DEG results
+qw <- nonadj_volc_plot(res, "PT1", "0% HBsAg+", "90% HBsAg+", "#004F8B","grey30",  4.5, 2, 20)
+
+# 1. Need the CTA_display_names to correspond to Entrez ID
+all_DEG <- res
+
+all_DEG$SYMBOL <- rownames(all_DEG)
+
+all_DEG_entrez <- merge(all_DEG, gene_annot, by = "SYMBOL")
+
+write.csv(all_DEG_entrez, file = "Output/DEG of PT1_D vs E_High vs Low HBV.csv")
+```
+
+If res requires the condition then it will be the positive log2FC.
+In this case, it is conditionE.
+  D: 0 Immune and 80-100% HBV
+  E: 0 Immune and 0% HBV
+
+```{r, echo=F}
+# 2. Extract the DEG (P<0.05 and FC > 1.5)
+#sig_genes <- subset(all_DEG_entrez, adj.P.Val<=0.05) 
+sig_genes <- subset(all_DEG_entrez, P.Value <=0.05)
+
+A_genes <- subset(sig_genes, logFC <= -log2(1.5)) #High HBV
+B_genes <- subset(sig_genes, logFC >= log2(1.5)) #Low HBV
+
+# 3. Need the background in Entrez ID
+galaxy <- subset(all_DEG_entrez, !is.na(all_DEG_entrez$ENTREZID)) 
+ 
+#----Create enrichGO object for High immune genes
+A <- enrichGO(gene = as.character(A_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.csv(x, file = "Output/Pathways in lowFibrosis_PT1_D vs E_D_highHBV.csv")
+
+#----Create enrichGO object for low HBV
+B <- enrichGO(gene = as.character(B_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+#barplot(B, 
+        #drop = TRUE, 
+        #showCategory = 20, 
+       # title = "",
+       # font.size = 8) 
+
+x <- as.data.frame(B$Description)
+x <- cbind(x,B$GeneRatio)
+x <- cbind(x, B$p.adjust)
+x <- cbind(x, B$geneID)
+
+#write.csv(x, file = "Output/Pathways in lowFibrosis_PT1_D vs E_E_lowHBV.csv")
+```
+There was no GO pathways associated with high HBV.
+
+
+### Low fibrosis (PT1)_Immune high (C) vs Immune low (D)
+
+  C: 2-10% Immune and 80-100% HBV
+  D: 0 Immune and 80-100% HBV
+  E: 0 Immune and 0% HBV 
+  
+```{r DEG PT1 immune high and low, fig.width=6, fig.height=6, echo=F}
+# refine datasets
+group_annot_temp <-group_annot[group_annot$Patient == "PT1",]
+
+filt_norm_data_temp <- filt_norm_data[,13:24]
+
+### New for aesthetics
+group_annot_temp$Condensed.groups[group_annot_temp$Condensed.groups == "C"] <- "HighImmune"
+group_annot_temp$Condensed.groups[group_annot_temp$Condensed.groups == "D"] <- "FewImmune"
+
+x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="HighImmune" | group_annot_temp$Condensed.groups == "FewImmune"]
+y <- group_annot_temp[group_annot_temp$Condensed.groups =="HighImmune" | group_annot_temp$Condensed.groups == "FewImmune",]
+
+
+#x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="C" | group_annot_temp$Condensed.groups == "D"]
+#y <- group_annot_temp[group_annot_temp$Condensed.groups =="C" | group_annot_temp$Condensed.groups == "D",]
+
+# make the expression set
+eset <- ExpressionSet(log2(as.matrix(x)))
+
+# define the factors that we want to model
+condition <- factor(y$Condensed.groups)
+
+# specify the design
+design <- model.matrix(~condition)
+
+# fit the linear model
+fit <- lmFit(eset, design)
+
+# run the DE analysis
+fit <- eBayes(fit, 
+              trend=TRUE, 
+              robust=TRUE, 
+              proportion = 0.01) # trend and robust make little difference.
+
+# extract the results
+res <- topTable(fit, coef="conditionHighImmune",n=Inf)
+res$gene <- rownames(res)
+
+#Calculate number of DEG
+sig_genes <- subset(res, adj.P.Val<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of FDR signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+sig_genes <- subset(res, P.Value<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of unadjusted signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+```
+
+```{r fig.width=6, fig.height=6, echo=F}
+#Retrieve volcano plots of DEG results
+as <- nonadj_volc_plot(res, "PT1", "0.5% CD45+", "5% CD45+", "#004F8B", "grey30",5,3,30)
+
+# 1. Need the CTA_display_names to correspond to Entrez ID
+all_DEG <- res
+
+all_DEG$SYMBOL <- rownames(all_DEG)
+
+all_DEG_entrez <- merge(all_DEG, gene_annot, by = "SYMBOL")
+
+write.csv(all_DEG_entrez, file = "Output/DEG of PT1_C vs D_High vs Low Immune.csv")
+```
+
+If res requires the condition then it will be the positive log2FC.
+In this case, it is conditionD.
+  D: 0 Immune and 80-100% HBV
+  C: 2-10% Immune and 80-100% HBV
+  
+```{r, echo=F}
+# 2. Extract the DEG (P<0.05 and FC > 1.5)
+#sig_genes <- subset(all_DEG_entrez, adj.P.Val<=0.05) 
+sig_genes <- subset(all_DEG_entrez, P.Value <=0.05)
+
+A_genes <- subset(sig_genes, logFC <= -log2(1.5)) #High Immune
+B_genes <- subset(sig_genes, logFC >= log2(1.5)) #Low Immune
+
+# 3. Need the background in Entrez ID
+galaxy <- subset(all_DEG_entrez, !is.na(all_DEG_entrez$ENTREZID)) 
+ 
+#----Create enrichGO object for High immune genes
+A <- enrichGO(gene = as.character(A_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+#barplot(A, 
+     #   drop = TRUE, 
+     #   showCategory = 20, 
+     #   title = "",
+     #   font.size = 8)
+
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.csv(x, file = "Output/Pathways in lowFibrosis_PT1_C vs D_D_highImmune.csv")
+
+#----Create enrichGO object for low HBV
+B <- enrichGO(gene = as.character(B_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+
+x <- as.data.frame(B$Description)
+x <- cbind(x,B$GeneRatio)
+x <- cbind(x, B$p.adjust)
+x <- cbind(x, B$geneID)
+
+#write.csv(x, file = "Output/Pathways in lowFibrosis_PT1_C vs D_C_lowImmune.csv")
+```
+There are no GO pathways associated with low immune ROI.
+
+```{r fig.width=6, fig.height=4, echo=F}
+top <- c(1,12,18,20) 
+
+top_names <- B$Description[top] 
+
+dotplot(B,
+        showCategory = top_names,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: PT1") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 10),
+              plot.title = element_text(size = 10, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 10),
+              legend.text = element_text(size = 10)) +
+        scale_color_gradient(low = "#004F8B", high = "grey80")
+
+```
+
+### High fibrosis (PT2)_HBV high (H) vs HBV low (F)
+
+  F: 0 Immune and 0-1% HBV
+  H: 0 Immune and 20% HBV
+  I: 40% Immune and 40% HBV
+  
+```{r DEG PT2 HBV high and low, fig.width=6, fig.height=6, echo=F}
+# refine datasets
+group_annot_temp <-group_annot[group_annot$Patient == "PT2",]
+
+filt_norm_data_temp <- filt_norm_data[,1:12]
+
+x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="F" | group_annot_temp$Condensed.groups == "H"]
+y <- group_annot_temp[group_annot_temp$Condensed.groups =="F" | group_annot_temp$Condensed.groups == "H",]
+
+# make the expression set
+eset <- ExpressionSet(log2(as.matrix(x)))
+
+# define the factors that we want to model
+condition <- factor(y$Condensed.groups)
+
+# specify the design
+design <- model.matrix(~condition)
+
+# fit the linear model
+fit <- lmFit(eset, design)
+
+# run the DE analysis
+fit <- eBayes(fit, 
+              trend=TRUE, 
+              robust=TRUE, 
+              proportion = 0.01) # trend and robust make little difference.
+
+# extract the results
+res <- topTable(fit, coef="conditionH",n=Inf)
+res$gene <- rownames(res)
+
+#Calculate number of DEG
+sig_genes <- subset(res, adj.P.Val<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of FDR signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+sig_genes <- subset(res, P.Value<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of unadjusted signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+```
+
+```{r fig.width=6, fig.height=6, echo=F}
+#Retrieve volcano plots of DEG results
+qe <- nonadj_volc_plot(res, "PT2", "0.5% HBsAg+", "20% HBsAg+", "#008C3A", "grey30",4.5,3,20)
+
+# 1. Need the CTA_display_names to correspond to Entrez ID
+all_DEG <- res
+
+all_DEG$SYMBOL <- rownames(all_DEG)
+
+all_DEG_entrez <- merge(all_DEG, gene_annot, by = "SYMBOL")
+
+write.csv(all_DEG_entrez, file = "Output/DEG of PT2_F vs H_High vs Low HBV.csv")
+```
+
+
+If res requires the condition then it will be the positive log2FC.
+In this case, it is conditionH.
+  F: 0 Immune and 0-1% HBV
+  H: 0 Immune and 20% HBV
+
+```{r, echo=F}
+# 2. Extract the DEG (P<0.05 and FC > 1.5)
+#sig_genes <- subset(all_DEG_entrez, adj.P.Val<=0.05) 
+sig_genes <- subset(all_DEG_entrez, P.Value <=0.05)
+
+A_genes <- subset(sig_genes, logFC <= -log2(1.5)) #Low HBV
+B_genes <- subset(sig_genes, logFC >= log2(1.5)) #High HBV
+
+# 3. Need the background in Entrez ID
+galaxy <- subset(all_DEG_entrez, !is.na(all_DEG_entrez$ENTREZID)) 
+ 
+#----Create enrichGO object for High immune genes
+A <- enrichGO(gene = as.character(A_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.csv(x, file = "Output/Pathways in highFibrosis_PT2_F vs H_F_lowHBV.csv")
+
+#----Create enrichGO object for low HBV
+B <- enrichGO(gene = as.character(B_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+#barplot(B, 
+     #   drop = TRUE, 
+     #   showCategory = 20, 
+    #    title = "",
+     #   font.size = 8) 
+
+x <- as.data.frame(B$Description)
+x <- cbind(x,B$GeneRatio)
+x <- cbind(x, B$p.adjust)
+x <- cbind(x, B$geneID)
+
+#write.csv(x, file = "Output/Pathways in highFibrosis_PT2_F vs H_H_highHBV.csv")
+```
+There are no GO Pathways for the HBV low ROIs.
+
+```{r fig.height=6, fig.width=6, echo=F}
+#top <- c(2,4,6) 
+#top_names <- A$Description[top] 
+
+dotplot(B,
+        #showCategory = top_names,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: High fibrosis (PT2) in immune high ROI") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 10),
+              plot.title = element_text(size = 10, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 10),
+              legend.text = element_text(size = 10)) +
+        scale_color_gradient(low = "#008C3A", high = "grey80")
+
+```
+
+### High fibrosis (PT2)_Immune high (I) vs Immune low (H)
+
+  F: 0 Immune and 0-1% HBV
+  H: 0 Immune and 20% HBV
+  I: 40% Immune and 40% HBV
+  
+```{r DEG PT2 immune high and low, fig.width=6, fig.height=6, echo=F}
+# refine datasets
+group_annot_temp <-group_annot[group_annot$Patient == "PT2",]
+
+filt_norm_data_temp <- filt_norm_data[,1:12]
+
+x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="H" | group_annot_temp$Condensed.groups == "I"]
+y <- group_annot_temp[group_annot_temp$Condensed.groups =="H" | group_annot_temp$Condensed.groups == "I",]
+
+# make the expression set
+eset <- ExpressionSet(log2(as.matrix(x)))
+
+# define the factors that we want to model
+condition <- factor(y$Condensed.groups)
+
+# specify the design
+design <- model.matrix(~condition)
+
+# fit the linear model
+fit <- lmFit(eset, design)
+
+# run the DE analysis
+fit <- eBayes(fit, 
+              trend=TRUE, 
+              robust=TRUE, 
+              proportion = 0.01) # trend and robust make little difference.
+
+# extract the results
+res <- topTable(fit, coef="conditionI",n=Inf)
+res$gene <- rownames(res)
+
+#Calculate number of DEG
+sig_genes <- subset(res, adj.P.Val<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of FDR signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+sig_genes <- subset(res, P.Value<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of unadjusted signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+```
+
+```{r fig.width=6, fig.height=6, echo=F}
+#Retrieve volcano plots of DEG results
+ad <- nonadj_volc_plot(res, "PT2", "0% CD45+", "40% CD45+", "#008C3A", "grey30",36,4,30)
+
+# 1. Need the CTA_display_names to correspond to Entrez ID
+all_DEG <- res
+
+all_DEG$SYMBOL <- rownames(all_DEG)
+
+all_DEG_entrez <- merge(all_DEG, gene_annot, by = "SYMBOL")
+
+write.csv(all_DEG_entrez, file = "Output/DEG of PT2_H vs I_High vs Low Immune.csv")
+```
+
+If res requires the condition then it will be the positive log2FC.
+In this case, it is conditionI.
+  I: 40% Immune and 40% HBV
+  H: 0 Immune and 20% HBV
+  
+```{r , fig.width=6, fig.height=6, fig.cap="GO.BP pathways analysis", echo=FALSE}
+# 2. Extract the DEG (FDR<0.05 and FC > 1.5)
+sig_genes <- subset(all_DEG_entrez, P.Value <=0.05) 
+
+A_genes <- subset(sig_genes, logFC <= -log2(1.5)) #Low immune 
+B_genes <- subset(sig_genes, logFC >= log2(1.5)) #High immune 
+
+# 3. Need the background in Entrez ID
+galaxy <- subset(all_DEG_entrez, !is.na(all_DEG_entrez$ENTREZID)) 
+
+#----Create enrichGO object for A_genes
+A <- enrichGO(gene = as.character(A_genes$ENTREZID), 
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+barplot(A, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "",
+        font.size = 8)
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.csv(x, file = "Output/Pathways of highFibrosis_PT2_H vs I_H_lowImmune.csv")
+
+
+#----Create enrichGO object for severe DAD
+B <- enrichGO(gene = as.character(B_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+barplot(B, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "",
+        font.size = 8) 
+
+x <- as.data.frame(B$Description)
+x <- cbind(x,B$GeneRatio)
+x <- cbind(x, B$p.adjust)
+x <- cbind(x, B$geneID)
+
+#write.csv(x, file = "Output/Pathways of highFibrosis_PT2_H vs I_I_highImmune.csv")
+```
+
+```{r fig.width=6, fig.height=6, echo=F}
+top <- c(2,4,8, 10, 17, 39, 42, 46, 47, 57) # arbitrary
+
+top_names <- B$Description[top] 
+
+dotplot(B,
+        showCategory = top_names,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: PT2") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 10),
+              plot.title = element_text(size = 10, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 10),
+              legend.text = element_text(size = 10)) +
+        scale_color_gradient(low = "#008C3A", high = "grey80")
+
+```
+
+### High fibrosis (PT2)_HBV high/Immune high (I) vs HBV low/Immune low (F)
+
+  F: 0 Immune and 0-1% HBV
+  H: 0 Immune and 20% HBV
+  I: 40% Immune and 40% HBV
+
+```{r DEG PT2 high and low, echo=F}
+# refine datasets
+group_annot_temp <-group_annot[group_annot$Patient == "PT2",]
+
+filt_norm_data_temp <- filt_norm_data[,1:12]
+
+x <- filt_norm_data_temp[,group_annot_temp$Condensed.groups =="F" | group_annot_temp$Condensed.groups == "I"]
+y <- group_annot_temp[group_annot_temp$Condensed.groups =="F" | group_annot_temp$Condensed.groups == "I",]
+
+# make the expression set
+eset <- ExpressionSet(log2(as.matrix(x)))
+
+# define the factors that we want to model
+condition <- factor(y$Condensed.groups)
+
+# specify the design
+design <- model.matrix(~condition)
+
+# fit the linear model
+fit <- lmFit(eset, design)
+
+# run the DE analysis
+fit <- eBayes(fit, 
+              trend=TRUE, 
+              robust=TRUE, 
+              proportion = 0.01) # trend and robust make little difference.
+
+# extract the results
+res <- topTable(fit, coef="conditionI",n=Inf)
+res$gene <- rownames(res)
+
+#Calculate number of DEG
+sig_genes <- subset(res, adj.P.Val<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of FDR signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+sig_genes <- subset(res, P.Value<=0.05) 
+FC_sig_genes <- subset(sig_genes, logFC <= -log2(1.5)| logFC >= log2(1.5))
+
+print(paste0("Number of unadjusted signficant genes over 1.5 fold change: ", length(rownames(FC_sig_genes))))
+
+```
+
+```{r , fig.width=6, fig.height=6, fig.cap="GO.BP pathways analysis", echo=FALSE}
+nonadj_volc_plot(res, "High fibrosis", "High Immune & High HBV", "Low Immune & Low HBV", "red", "grey30", 14, 7, 30) 
+
+# 1. Need the CTA_display_names to correspond to Entrez ID
+all_DEG <- res
+
+all_DEG$SYMBOL <- rownames(all_DEG)
+
+all_DEG_entrez <- merge(all_DEG, gene_annot, by = "SYMBOL")
+
+write.csv(all_DEG_entrez, file = "Output/DEG of highFibrosis_PT2_F vs I_Nowt vs High Immune High HBV.csv")
+```
+
+If res requires the condition then it will be the positive log2FC.
+In this case, it is conditionI.
+
+  F: 0 Immune and 0-1% HBV
+  I: 40% Immune and 40% HBV
+  
+```{r, echo=F}
+# 2. Extract the DEG (FDR<0.05 and FC > 1.5)
+sig_genes <- subset(all_DEG_entrez, P.Value<=0.05)
+
+A_genes <- subset(sig_genes, logFC <= -log2(1.5)) #Nowt
+B_genes <- subset(sig_genes, logFC >= log2(1.5)) #High immune and high HBV
+
+# 3. Need the background in Entrez ID
+galaxy <- subset(all_DEG_entrez, !is.na(all_DEG_entrez$ENTREZID)) 
+
+#----Create enrichGO object 
+A <- enrichGO(gene = as.character(A_genes$ENTREZID), 
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) 
+
+barplot(A, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "",
+        font.size = 8)
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.csv(x, file = "Output/Pathways of highFibrosis_PT2_F vs I_F_No Immune No HBV.csv")
+
+#----Create enrichGO object
+B <- enrichGO(gene = as.character(B_genes$ENTREZID), #the DEG in Entrez_ID
+                      universe = as.character(galaxy$ENTREZID[galaxy$gene %in% rownames(res)]),  
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.1) #0.5 is only two at 0.9 pvalue
+
+barplot(B, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "",
+        font.size = 8) 
+
+x <- as.data.frame(B$Description)
+x <- cbind(x,B$GeneRatio)
+x <- cbind(x, B$p.adjust)
+x <- cbind(x, B$geneID)
+
+#write.csv(x, file = "Pathways of highFibrosis_PT2_F vs I_I_High Immune High HBV.csv")
+```
+
+
+## The end

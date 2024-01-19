@@ -1,0 +1,332 @@
+---
+title: "Quality control and normalisation"
+author: "Amy Cross"
+date: "2024-01-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(openxlsx)
+library(tidyverse)
+library(patchwork)
+library(preprocessCore) #quantile.normalise
+library(factoextra) #PCA functions
+library(ggrepel)
+library(ggpubr)
+
+#Set the working directory
+knitr::opts_knit$set(root.dir = "E:/Projects and TRIG work/Collaborations and assorted DSP projects/HBV and HIV Peppa Dimitra DSP/Github repo")
+```
+
+
+### Import data required for this quality control assessment
+
+-   **GeoMx.xlsx** - Sequencing quality and metadata and the probe-aggregate gene detection values (plus NegProbe-WTX). 
+-   **ROI annotations.xlsx** - Sample and ROI annotations.
+
+```{r import, include=FALSE}
+roi_properties <- read.xlsx("Data/GeoMx output.xlsx", sheet = "SegmentProperties")
+
+gene_detection <- read.xlsx("Data/GeoMx output.xlsx", sheet = "Raw gene x ROI", sep.names = " ")
+rownames(gene_detection) <- gene_detection$TargetName
+
+group_annot <- read.xlsx("Data/ROI annotations.xlsx", sheet = "ROI metadata")
+```
+
+
+
+### Sequencing QC
+
+```{r sequencing qc, fig.width=8, fig.height=4.5, echo=F}
+read_qc <- roi_properties %>% 
+  gather(key = "Sequencing step", value = "# reads", c("RawReads", "TrimmedReads", "StitchedReads", "AlignedReads", "DeduplicatedReads")) %>%
+  mutate(`Sequencing step` = factor(`Sequencing step`, levels=c("RawReads", "TrimmedReads", "StitchedReads", "AlignedReads", "DeduplicatedReads"))) 
+
+read_qc_plot <- ggplot(data = read_qc, aes(x = `Sequencing step`, y = `# reads`, fill = `Sequencing step`)) + 
+  geom_boxplot() +
+  geom_jitter(width = 0.1, size = 1.2) +
+  theme_bw() +
+  scale_y_log10() +
+  geom_hline(yintercept=1000, linetype= "dashed") +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+seq_sat_plot <- ggplot(roi_properties) +
+  geom_jitter(aes(x = "HCA CTA experiment", y = `SequencingSaturation`), size =1.2) +
+  scale_y_continuous(limits = c(0,100)) +
+  theme_bw() +
+  theme(axis.title.x = element_blank()) +
+  geom_hline(yintercept=50, linetype= "dashed")
+
+seq_by_ROI <- ggplot(data = read_qc, aes(x = `SegmentDisplayName`, y = `# reads`,group = `Sequencing step`, col = `Sequencing step`)) + 
+  geom_line() + 
+  theme_bw() +
+  scale_y_log10() +
+ geom_hline(yintercept=1000, linetype= "dashed") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+read_qc_plot + seq_sat_plot + plot_layout(widths = c(3:1))
+seq_by_ROI
+```
+
+Just one low sequencing saturation point that stands out, but it is above the 50% threshold. This ROI had decent deduplicated reads and estimated nuclei counts. The negative probe value is low at 2.65.
+
+Good sequencing quality overall.
+
+
+
+### ROI size
+
+```{r area vs nuclei, fig.width=4, fig.height=3, echo=F}
+roi_properties$Immune <- group_annot$Estimated.Immune
+roi_properties$HBV <- group_annot$Estimated.HBV
+roi_properties$comp_groups <- group_annot$Comprehensive.groups
+roi_properties$cond_groups <- group_annot$Condensed.groups
+
+ggplot(data=roi_properties, aes(x = AOINucleiCount, y = AOISurfaceArea, col = SlideName)) +
+  geom_point() + 
+  theme_bw() +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_vline(xintercept = 100, linetype = 2)
+
+print(paste0("Mean AOI surface area: ", round(mean(roi_properties$AOISurfaceArea),2), " (standard deviation +/- ", round(sd(roi_properties$AOISurfaceArea),2)))
+
+print(paste0("Mean AOI nuclei: ", round(mean(roi_properties$AOINucleiCount),2), " (standard deviation +/- ", round(sd(roi_properties$AOINucleiCount),2)))
+```
+
+There are differences in segment density that likely correlates with inflammation.  Segment size and density here is not sample-specific.  All ROI contain >150 estimated nuclei, which is beneficial for assay sensitivity.  
+
+The lowest nuclei count of 140 is inaccurate, as the ROI image looks comparable to all the other ROIs.
+
+
+
+#Negative probe counts  
+
+```{r extract negative probe variation data, fig.width=3.5, fig.height=3, echo=F}
+#Create a df of all the negative probes x AOI
+neg <- gene_detection[grepl("Neg", gene_detection$TargetName),]
+rownames(neg) <- neg$ProbeDisplayName
+neg <- neg[,2:38] #check no genes have snuck in
+
+neg <- as.data.frame(t(neg))
+
+#Plot negatives
+negx <- neg
+negx$SegmentName <- rownames(negx)
+negx$Tissue <- roi_properties$SlideName
+
+ggplot(data=negx, aes(x = Tissue, y = V1)) +
+  geom_boxplot(col = "red", outlier.shape = NA) +
+  geom_point(size = 0.7) +
+  theme_bw() +
+  geom_hline(yintercept = 5, col = "blue", linetype = 2) +
+  scale_y_log10() +
+  geom_text_repel(data = negx, aes(x = Tissue, y=V1, label = ifelse(V1 < 5, rownames(negx),"")), min.segment.length = 0,max.overlaps = 10, size=2) +
+  ylab("Negative probe values")
+```
+
+The default negative probe threshold is 5.  Low negative probes can indicate poor differentiation between negative and positive signals.  
+
+
+
+### Calculate the number of detectable genes
+
+#### Manual negative probe thresholds
+
+```{r calculate detectable genes by SD, echo=F}
+#The output of ratios_to_neg is the relationship to the LOQ (1 means the gene expression is equal to the LOQ for that AOI).
+ratios_to_neg <- gene_detection[,2:length(colnames(gene_detection))]
+
+for (x in colnames(gene_detection[,2:length(colnames(gene_detection))])){
+  b <- (gene_detection[,x]/neg[x,"V1"])
+  ratios_to_neg[,x] <- b
+  }   
+
+
+# Gather the ratios_to_neg into a plottable format
+ratios_to_neg <- as.data.frame(t(ratios_to_neg)) #Transform data for gather function
+ratios_to_neg$segment <- rownames(ratios_to_neg) #Label data for gather function
+gath_ratios_to_neg <- gather(ratios_to_neg, key = "genes", value = "signal to noise ratio", c(rownames(gene_detection[,2:length(colnames(gene_detection))]))) #Gather into plotting format
+
+
+# Decide the threshold parameters
+min_num_AOI <- 3 
+ratio_threshold <- 2.5 #genes equal to the LOQ is 1
+
+
+# Calculate and save the number of genes that are higher than the negative geomean in more than the minimum number of AOI.  Save the list as "keepers".
+num_over_threshold <- apply(ratios_to_neg[,1:18677], 2, function(x){length(x[x > ratio_threshold])})
+
+print(paste0("The number of genes over this threshold of (",ratio_threshold," x the negative probe geomean) in any AOI is :",length(num_over_threshold[num_over_threshold>0]),"/18677 genes." )) 
+print(paste0("The number of genes over this threshold of (",ratio_threshold," x the negative probe geomean) in ",min_num_AOI," or more AOI is :",length(num_over_threshold[num_over_threshold>=min_num_AOI]),"/18677.")) 
+
+#keepers <- colnames(ratios_to_neg[1:18677])[num_over_threshold>=min_num_AOI]
+```
+
+```{r Number of genes over 2.5 standard deviations from the negative,  fig.width=16, fig.height=5, echo=F}
+# Calculate and save the number of genes each AOI.
+num_over_threshold <- apply(ratios_to_neg[,1:18677], 1, function(x){length(x[x > ratio_threshold])})
+negx$genes_per_AOI <- num_over_threshold
+
+ggplot(data = negx, aes(x = SegmentName, y = genes_per_AOI, col = Tissue)) +
+  geom_point(size=4) +
+  theme_bw() +
+  ggtitle("Number of genes over 2.5 standard deviations from the negative geomean per AOI") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 35, vjust = 1, hjust = 1)) 
+```
+
+#### LOQ negative probe thresholds
+
+```{r calculate detectable genes over LOQ, echo=F}
+#The output of ratios_to_neg is the relationship to the LOQ (1 means the gene expression is equal to the LOQ for that AOI).
+ratios_to_neg <- gene_detection[,2:length(colnames(gene_detection))]
+
+ratios_to_neg <- as.data.frame(apply(ratios_to_neg, 1, function(x){x-roi_properties$`LOQ.(Human.NGS.Whole.Transcriptome.Atlas.RNA_1.0)`}))
+
+# Decide the threshold parameters
+min_num_AOI <- 3 
+ratio_threshold <- 1 #genes equal to the LOQ is 1
+
+
+# Calculate and save the number of genes that are higher than the negative geomean in more than the minimum number of AOI.  Save the list as "keepers".
+num_over_threshold <- apply(ratios_to_neg[,1:18677], 2, function(x){length(x[x > ratio_threshold])})
+
+print(paste0("The number of genes over AOI-specific LOQ is :",length(num_over_threshold[num_over_threshold>0]),"/18677 genes." )) 
+print(paste0("The number of genes over the LOQ in ",min_num_AOI," or more AOI is :",length(num_over_threshold[num_over_threshold>=min_num_AOI]),"/18677.")) 
+
+keepers <- colnames(ratios_to_neg[1:18677])[num_over_threshold>=min_num_AOI]
+```
+```{r Number of genes over the LOQ per AOI, fig.width=16, fig.height=5, echo=F}
+# Calculate and save the number of genes each AOI.
+num_over_threshold <- apply(ratios_to_neg[,1:18677], 1, function(x){length(x[x > ratio_threshold])})
+negx$genes_per_AOI <- num_over_threshold
+
+ggplot(data = negx, aes(x = SegmentName, y = genes_per_AOI, col = Tissue)) +
+  geom_point(size=4) +
+  theme_bw() +
+  ggtitle("Number of genes over the LOQ per AOI") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 35, vjust = 1, hjust = 1)) 
+```
+LOQ was used as the threshold for gene inclusion in this analysis.
+
+
+### Filtered then quantile normalized data
+
+```{r normalise to QN, fig.width=20, fig.height=6, echo=F}
+#Filtering
+x <- gene_detection[,2:38]
+filt <- x[keepers,]
+qn <- as.data.frame(normalize.quantiles(as.matrix(filt)))
+colnames(qn) <-  colnames(gene_detection)[2:38]
+rownames(qn) <- rownames(filt)
+
+write.csv(qn, "Output/Quantile_genes.csv")
+
+### PCA and distribution plots
+
+countsx <- as.data.frame(t(qn))
+countsx$AOI <- roi_properties$SegmentDisplayName
+countsx$Tissue <- roi_properties$SlideName
+
+longform <- gather(countsx, key = "Genes", value = "Counts", keepers)
+
+the_plot_all_box <- ggplot(data = longform, aes(x = AOI, y = Counts, fill = Tissue)) +
+  geom_boxplot(outlier.colour = "grey40", 
+               outlier.shape=16, 
+               outlier.size=1, 
+               notch = FALSE) +
+  scale_y_continuous(trans='log10') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),  
+        legend.title = element_text(face = 2),
+        plot.title = element_text(hjust = 0.5, face="bold")) +
+  xlab("Areas of interest") +
+  ylab("Quantile normalised counts") +
+  ggtitle("Filtered genes")
+
+the_plot_all_box
+
+
+
+#Apply PCA
+counts <- qn #genes in rows
+pca_core1 <- prcomp(t(log2(counts+1)), scale=F) 
+
+a <- fviz_pca_ind(pca_core1, 
+             geom.ind = c("point", "shape"), 
+             axes = c(1,2), #dimensions
+             labelsize = 3, #label size
+             pointsize = 3, #point size
+             col.ind = roi_properties$SlideName, 
+             invisible="quali", #turn off group centroids
+             addEllipses = FALSE, #No ellipses for clustering
+             repel = TRUE,
+             legend.title = "AOI histology") +
+  ggtitle("AOI histology") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face="bold")) 
+
+b <- fviz_pca_ind(pca_core1, 
+             geom.ind = c("point", "shape"), 
+             axes = c(1,2), #dimensions
+             labelsize = 3, #label size
+             pointsize = 3, #point size
+             col.ind = group_annot$Estimated.Immune, 
+             invisible="quali", #turn off group centroids
+             addEllipses = FALSE, #No ellipses for clustering
+             repel = TRUE,
+             legend.title = "Segment label") +
+  ggtitle("Segment label") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face="bold")) 
+
+c <- fviz_pca_ind(pca_core1, 
+             geom.ind = c("point", "shape"), 
+             axes = c(1,2), #dimensions
+             labelsize = 3, #label size
+             pointsize = 3, #point size
+             col.ind = group_annot$Estimated.HBV, 
+             invisible="quali", #turn off group centroids
+             addEllipses = FALSE, #No ellipses for clustering
+             repel = TRUE,
+             legend.title = "Segment label") +
+  ggtitle("Segment label") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face="bold")) 
+
+a + b + c
+
+```
+
+### Housekeeping genes after quantile normalisation
+
+```{r fig.width=7, fig.height=3, echo=F}
+irg <- c("ACTB","EIF2B4","OAZ1","POLR1B","RPLP0","POLR2A","PUM1","SDHA","TUBB","UBB")
+
+x <- gene_detection[,2:38]
+filt <- x[keepers,]
+qn <- as.data.frame(normalize.quantiles(as.matrix(filt)))
+colnames(qn) <-  colnames(gene_detection)[2:38]
+rownames(qn) <- rownames(filt)
+
+countsx <- as.data.frame(t(qn))
+countsx$AOI <- roi_properties$SegmentDisplayName
+countsx$Tissue <- roi_properties$SlideName
+
+y <- select(countsx, any_of(c(irg, "Tissue", "AOI")))
+longform <- gather(y, key = "Genes", value = "Counts", any_of(irg))
+
+z <- ggplot(data = longform, aes(x = AOI, y = Counts, group = Genes, col = Genes)) +
+  geom_line() +
+  scale_y_log10(limits = c(1,3000)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 5, angle = 90, hjust = 0.5, vjust = 0.5)) +
+  ggtitle("Example housekeeping genes")
+
+z
+```

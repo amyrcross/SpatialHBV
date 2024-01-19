@@ -1,0 +1,668 @@
+---
+title: "WGCNA"
+author: "Amy Cross"
+date: "2024-01-19"
+output: html_document
+---
+
+###Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(WGCNA)
+library(tidyverse)
+library(openxlsx)
+
+library(ComplexHeatmap)
+library(circlize)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+library(patchwork)
+
+#Set the working directory
+knitr::opts_knit$set(root.dir = "E:/Projects and TRIG work/Collaborations and assorted DSP projects/HBV and HIV Peppa Dimitra DSP/Github repo")
+```
+
+###Import data
+
+```{r import data, echo=F}
+# Import annotations
+meta <- read.xlsx("Data/ROI annotations.xlsx", sheet = "ROI metadata")
+
+# Import quantile normalized and filtered data
+filt_norm_data <- read.csv("Output/Quantile_genes.csv", row.names = 1, check.names = F)
+
+# Log2(n+1) transformation of expression data
+filt_norm_data <- log2(filt_norm_data+1)
+
+#Transpose
+filt_norm_data0 = as.data.frame(t(filt_norm_data)) 
+
+#gene annotations
+gene_annot <- read.xlsx("Reference/Gene symbols and Entrez ID for detectable transcripts.xlsx", sheet = "Gene symbols and Entrez ID for ")
+
+```
+
+### Identify outlying samples by hclust (uses 'Import data')
+
+```{r identify outlying samples by hclust, fig.height=9, fig.width=12}
+# The following setting is important, do not omit.
+options(stringsAsFactors = FALSE)
+
+# We first check for genes and samples with too many missing values:
+gsg = goodSamplesGenes(filt_norm_data0, verbose = 3);
+gsg$allOK #True
+
+# Next we cluster the samples (in contrast to clustering genes that will come later) to see if there are any obvious outliers.
+sampleTree = hclust(dist(filt_norm_data0), method = "average")
+
+# Plot the sample tree 
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+cex.axis = 1.5, cex.main = 2) +
+abline(h = 80, col = "red")
+
+# Determine clusters under the line
+clust = cutreeStatic(sampleTree, cutHeight = 80, minSize = 2)
+table(clust)
+
+```
+
+### Produce traits and annotations (uses 'Import data')
+
+```{r Process the data traits and annotations}
+# Remove columns that hold information we do not need.
+meta = meta[, -c(5,6,7,8,9)] #Might need to get rid of the unique name columns.
+names(meta)
+
+# Form a data frame analogous to expression data that will hold the clinical traits.
+HBVSamples = rownames(filt_norm_data0)
+HBVtraitRows = match(HBVSamples,meta$SegmentDisplayName)
+HBVdatTraits = meta[HBVtraitRows, -1];
+rownames(HBVdatTraits) = meta[HBVtraitRows, 1];
+HBVdatTraits = meta[HBVtraitRows, -1];
+
+# Before we continue with network construction and module detection, we visualize how the clinical traits relate to the sample outlier dendrogram.
+
+# Re-cluster samples
+HBVsampleTree2 = hclust(dist(filt_norm_data0), method = "average")
+
+# Convert traits to a color representation: white means low, red means high, grey means missing entry.  Make the categorical traits into factors then numbers.
+HBVdatTraits <- mutate(HBVdatTraits, Patient = factor(Patient, levels = unique(Patient)))
+HBVdatTraits$Patient <- as.numeric(HBVdatTraits$Patient)
+
+HBVdatTraits <- mutate(HBVdatTraits, Condensed.groups = factor(Condensed.groups, levels = unique(Condensed.groups)))
+HBVdatTraits$Condensed.groups <- as.numeric(HBVdatTraits$Condensed.groups)
+
+HBVdatTraits <- HBVdatTraits[,-c(1)]
+
+HBVtraitColors = numbers2colors(HBVdatTraits, signed = FALSE);
+
+# Plot the sample dendrogram with the colors underneath.
+plotDendroAndColors(HBVsampleTree2, HBVtraitColors,
+groupLabels = names(HBVdatTraits),
+main = "Sample dendrogram and trait heatmap",
+cex.dendroLabels = 0.4)
+
+# Save the traits and processed expression data as an .RData file by removing the hashtag
+save(filt_norm_data0, HBVdatTraits, file = "Output/WGCNA/HBV-01-dataInput.RData")
+```
+
+### Soft power threshold (uses .RData produced by 'Identify outlying...' and 'Produce traits')
+
+```{r soft power threshold, fig.height=5, fig.width=4.5}
+options(stringsAsFactors = FALSE)
+
+# Load the data saved in the first part
+lnames = load(file = "Output/WGCNA/HBV-01-dataInput.RData")
+
+# Choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+# Call the network topology analysis function, specifying the correlation function and network type.  This may take a moment.
+sft = pickSoftThreshold(filt_norm_data0, powerVector = powers, verbose = 5, corFnc = "bicor", networkType = "signed hybrid")
+
+# Plot the results of scale independence
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+main = paste("Scale independence")) +
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+labels=powers,cex=0.9,col="red") + 
+abline(h=0.90,col="red") #this line corresponds to using an R^2 cut-off of h
+
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+main = paste("Mean connectivity")) +
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=0.9,col="red")
+```
+
+
+### Construct the gene network and identify modules (uses .RData produced by 'Identify outlying...' and 'Produce traits...')
+
+```{r Construct the gene network and identify modules}
+net = blockwiseModules(
+  filt_norm_data0, 
+  power = 5, 
+  networkType = "signed hybrid", 
+  corType = "bicor", 
+  maxPOutliers = 0.05, 
+  robustY = FALSE,
+  TOMType = "signed", 
+  minModuleSize = 30,
+  reassignThreshold = 0, 
+  mergeCutHeight = 0.25, 
+  numericLabels = TRUE, 
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "Output/WGCNA/HBVsignedTOM",
+  verbose = 3)
+```
+
+### Explore # modules (uses net object produced by 'Construct...')
+
+```{r explore modules}
+#Higher power reduces modules. Raising merge cutoff reduces modules.
+table(net$colors) 
+
+# Convert labels to colors for plotting
+mergedColors = labels2colors(net$colors)
+table(mergedColors)
+
+# Plot gene dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+"Module colors", dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05)
+```
+
+### Save modules and eigengenes
+
+```{r save modules and eigengenes, echo=F}
+# Extract data from net. Save the module assignment and module eigengene information necessary for subsequent analyses.
+moduleLabels = net$colors
+moduleColors = labels2colors(net$colors)
+MEs = net$MEs;
+geneTree = net$dendrograms[[1]];
+save(net, MEs, moduleLabels, moduleColors, geneTree, file = "Output/WGCNA/HBV-power5-cutoff0.25-02-networkConstruction-auto.RData")
+```
+
+### Module-trait relationships (uses .RData produced by 'Identify outlying...', 'Produce traits...' and 'Save modules...')
+
+```{r Module trait relationships, fig.width=7, fig.height=7}
+# Load data if necessary
+lnames = load(file = "Output/WGCNA/HBV-01-dataInput.RData");
+lnames = load(file = "Output/WGCNA/HBV-power5-cutoff0.25-02-networkConstruction-auto.RData");
+
+# Define numbers of genes and samples
+nGenes = ncol(filt_norm_data0);
+nSamples = nrow(filt_norm_data0);
+
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(filt_norm_data0, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, HBVdatTraits, use = "p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor[,4:8], 2), "\n(",
+signif(moduleTraitPvalue[,4:8], 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor[,4:8])
+par(mar = c(6, 8.5, 3, 3));
+
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor[,4:8],
+xLabels = names(HBVdatTraits[,4:8]),
+yLabels = names(MEs),
+ySymbols = names(MEs),
+colorLabels = FALSE,
+colors = greenWhiteRed(50),
+textMatrix = textMatrix,
+setStdMargins = FALSE,
+cex.text = 0.5,
+zlim = c(-1,1),
+main = paste("Module-trait relationships"))
+
+# names (colors) of the modules
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(filt_norm_data0, MEs, use = "p"));
+
+
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples));
+names(geneModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+
+#write.csv(geneModuleMembership, "Output/WGCNA/HBV Gene Module Membership.csv")
+
+#Grey (unallocated genes) is 1150 genes
+names(filt_norm_data0)[moduleColors=="red"]
+table(moduleColors)
+```
+
+### !!!Eigenegene heatmap
+
+```{r Eigenegene heatmap, echo=F}
+MEs <- as.matrix(t(MEs[,1:8])) 
+module_colors = gsub("ME","",rownames(MEs))
+names(module_colors) <- rownames(MEs)
+col_fun = colorRamp2(c(0, 20, 100), c("white", "gray", "blue"))
+
+
+rann <- HeatmapAnnotation(modules=rownames(MEs),
+                          col=list(modules=module_colors),
+                          which="row",
+                          show_legend = FALSE,
+                          annotation_name_gp = gpar(fontsize = 10),
+                          border = TRUE,
+                          show_annotation_name = c(module = FALSE))
+
+cann <- HeatmapAnnotation(Tissue = meta$Patient,
+                          HBV = meta$Numeric.Estimated.HBV,
+                          Immune = meta$Numeric.Estimated.Immune,
+                          col=list(Tissue = c("PT2" = "#008C3A", "PT1" = "#004F8B", "PT3" = "#CC0066"),
+                          HBV = col_fun,
+                          Immune = col_fun),
+                          border = FALSE, 
+                          annotation_name_gp= gpar(fontsize = 7),
+                          simple_anno_size_adjust = TRUE, 
+                          height = unit(1.5,"cm"))
+
+
+ht <- Heatmap(MEs,
+        top_annotation = cann,
+        right_annotation = rann,
+        show_column_names = FALSE,
+        row_names_gp = gpar(fontsize =10, fontface = "bold"),
+        border = TRUE,
+        heatmap_legend_param = list(
+                             title = "Eigengene \nexpression"
+                           ))
+
+htd = draw(ht, merge_legend = TRUE)
+```
+
+### !!!Cluster prolifer of the different modules
+
+```{r, fig.height=6, fig.width=12, echo=F}
+xx <- data.frame(Modules = mergedColors, SYMBOL = colnames(filt_norm_data0))
+
+# 1. Need the genes to correspond to Entrez ID
+
+all_DEG_entrez <- merge(xx, gene_annot, by = "SYMBOL")
+
+all_DEG_entrez_brown <- subset(all_DEG_entrez, Modules == "brown") #
+all_DEG_entrez_black <- subset(all_DEG_entrez, Modules == "black") #
+all_DEG_entrez_blue <- subset(all_DEG_entrez, Modules == "blue") #
+all_DEG_entrez_yellow <- subset(all_DEG_entrez, Modules == "yellow") #
+all_DEG_entrez_green <- subset(all_DEG_entrez, Modules == "green") #
+all_DEG_entrez_pink <- subset(all_DEG_entrez, Modules == "pink") #
+all_DEG_entrez_red <- subset(all_DEG_entrez, Modules == "red") #
+all_DEG_entrez_turquoise <- subset(all_DEG_entrez, Modules == "turquoise") #
+
+```
+
+#### Pink
+```{r echo=F}
+#----Create enrichGO object for severe DAD
+go_enrich_pink <- enrichGO(gene = all_DEG_entrez_pink$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10) 
+A <- go_enrich_pink
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_pink), file = "Ouputs/WGCNA/Pink module.xlsx")
+```
+
+#### Red
+```{r echo=F}
+go_enrich_red <- enrichGO(gene = all_DEG_entrez_red$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10) 
+
+A <- go_enrich_red
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_red), file = "Ouput/WGCNA/Red module.xlsx")
+```
+
+#### Blue
+```{r echo=F}
+go_enrich_blue <- enrichGO(gene = all_DEG_entrez_blue$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+
+A <- go_enrich_blue
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_blue), file = "Output/WGCNA/Blue module.xlsx")
+```
+
+#### Turquoise
+```{r echo=F}
+go_enrich_turquoise <- enrichGO(gene = all_DEG_entrez_turquoise$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+
+A <- go_enrich_turquoise
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_turquoise), file = "Output/WGCNA/Turquoise module.xlsx")
+```
+
+#### Yellow
+```{r echo=F}
+go_enrich_yellow <- enrichGO(gene = all_DEG_entrez_yellow$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+
+A <- go_enrich_yellow
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_yellow), file = "Output/WGCNA/Yellow module.xlsx")
+```
+
+#### Green
+```{r echo=F}
+go_enrich_green <- enrichGO(gene = all_DEG_entrez_green$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+
+A <- go_enrich_green
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_green), file = "Output/WGCNA/Green module.xlsx")
+```
+
+#### Brown
+```{r echo=F}
+go_enrich_brown <- enrichGO(gene = all_DEG_entrez_brown$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+
+A <- go_enrich_brown
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_brown), file = "Output/WGCNA/Brown module.xlsx")
+```
+
+#### Black
+```{r echo=F}
+go_enrich_black <- enrichGO(gene = all_DEG_entrez_black$ENTREZID, #the DEG in Entrez_ID
+                      universe = names(gene_annot$SYMBOL),  #the DEG are compared to the whole transcriptome
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = "ENTREZID", #keytypes(org.Hs.eg.db)
+                      readable = T, 
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+
+A <- go_enrich_black
+
+x <- as.data.frame(A$Description)
+x <- cbind(x,A$GeneRatio)
+x <- cbind(x, A$p.adjust)
+x <- cbind(x, A$geneID)
+
+#write.xlsx(list('Pathways' = x, 'Genes' = all_DEG_entrez_black), file = "Output/WGCNA/Black module.xlsx")
+```
+
+#### Barplots of pathways
+```{r, echo=F}
+#----Rough barplot/dotplot of enrichGO object of severe DAD
+red <- barplot(go_enrich_red, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Red",
+        font.size = 6) 
+
+blue <- barplot(go_enrich_blue, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Blue",
+        font.size = 6) 
+
+turquoise <- barplot(go_enrich_turquoise, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Turquoise",
+        font.size = 6) 
+
+yellow <- barplot(go_enrich_yellow, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Yellow",
+        font.size = 6)
+
+green <- barplot(go_enrich_green, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Green",
+        font.size = 6)
+
+brown <- barplot(go_enrich_brown, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Brown",
+        font.size = 6)
+
+pink <- barplot(go_enrich_pink, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Pink",
+        font.size = 6)
+
+black <- barplot(go_enrich_black, 
+        drop = TRUE, 
+        showCategory = 20, 
+        title = "Black",
+        font.size = 6)
+
+
+red + blue + turquoise + brown + plot_layout(nrow = 1)
+yellow + green + pink + plot_layout(nrow = 1)
+table(mergedColors)
+
+green + blue + turquoise + plot_layout(nrow = 1)
+yellow + pink + plot_layout(nrow = 1)
+```
+
+### Blue and Yellow dotplots
+
+```{r fig.height=7, fig.width=5, echo=F}
+#YELLOW
+top <- c(6,7,13,19,23,25,29,33,35,46,90,94) # 12 top pathways
+top_names_yellow <- go_enrich_yellow$Description[top] 
+
+x <- dotplot(go_enrich_yellow,
+        showCategory = top_names_yellow,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: Yellow") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 7),
+              plot.title = element_text(size = 7, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 7),
+              axis.text.x = element_text(size = 7),
+              axis.title.x = element_text(size = 7),
+              legend.text = element_text(size = 7)) +
+        scale_color_gradient(low = "yellow", high = "grey80")
+
+#BLUE
+top <- c(1,3,17,32,35,37) # arbitrary
+top_names_blue <- go_enrich_blue$Description[top] 
+
+y <- dotplot(go_enrich_blue,
+        showCategory = top_names_blue,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: Blue") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 7),
+              plot.title = element_text(size = 7, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 7),
+              axis.text.x = element_text(size = 7),
+              axis.title.x = element_text(size = 7),
+              legend.text = element_text(size = 7)) +
+        scale_color_gradient(low = "blue", high = "grey80")
+
+
+
+x/y
+```
+
+### Red and Brown dotplots
+
+```{r fig.height=7, fig.width=5, echo=F}
+#YELLOW
+top <- c(2,3,7,9,13) # 12 top pathways
+top_names_red <- go_enrich_red$Description[top] 
+
+r <- dotplot(go_enrich_red,
+        showCategory = top_names_red,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: Red") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 7),
+              plot.title = element_text(size = 7, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 7),
+              axis.text.x = element_text(size = 7),
+              axis.title.x = element_text(size = 7),
+              legend.text = element_text(size = 7)) +
+        scale_color_gradient(low = "red", high = "grey80")
+
+#BLUE
+top <- c(5,10,11,14,20,39) # arbitrary
+top_names_brown <- go_enrich_brown$Description[top] 
+
+b <- dotplot(go_enrich_brown,
+        showCategory = top_names_brown,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: Brown") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 7),
+              plot.title = element_text(size = 7, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 7),
+              axis.text.x = element_text(size = 7),
+              axis.title.x = element_text(size = 7),
+              legend.text = element_text(size = 7)) +
+        scale_color_gradient(low = "brown", high = "grey80")
+
+
+r/b
+```
+
+
+### Pink and Green dotplots
+
+```{r fig.height=7, fig.width=5, echo=F}
+#YELLOW
+top <- c(2,3,4,8) # 12 top pathways
+top_names_pink <- go_enrich_pink$Description[top] 
+
+p <- dotplot(go_enrich_pink,
+        showCategory = top_names_pink,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: Pink") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 7),
+              plot.title = element_text(size = 7, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 7),
+              axis.text.x = element_text(size = 7),
+              axis.title.x = element_text(size = 7),
+              legend.text = element_text(size = 7)) +
+        scale_color_gradient(low = "pink", high = "grey80")
+
+#BLUE
+top <- c(1,6,18) # arbitrary
+top_names_green <- go_enrich_green$Description[top] 
+
+g <- dotplot(go_enrich_green,
+        showCategory = top_names_green,
+        font.size = 10) +
+  #scale_x_continuous(limits = c(0,0.35)) +
+  #scale_size(limits=c(0,25), range = c(1,10)) +
+        ggtitle("GO Biological Processes: Green") +
+        theme(legend.position = "right", 
+              legend.title = element_text(size = 7),
+              plot.title = element_text(size = 7, hjust = 1, face = "bold"), 
+              axis.text.y = element_text(size = 7),
+              axis.text.x = element_text(size = 7),
+              axis.title.x = element_text(size = 7),
+              legend.text = element_text(size = 7)) +
+        scale_color_gradient(low = "darkgreen", high = "grey80")
+
+
+p/g
+```

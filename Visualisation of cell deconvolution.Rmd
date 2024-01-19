@@ -1,0 +1,258 @@
+---
+title: "Cell deconvolution plot"
+output: html_document
+date: "2023-09-04"
+---
+
+# Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(openxlsx)
+library(tidyverse)
+library(Hmisc)
+library(circlize)
+library(corrplot)
+library(patchwork)
+library("ggsci")
+
+knitr::opts_knit$set(root.dir = "E:/Projects and TRIG work/Collaborations and assorted DSP projects/HBV and HIV Peppa Dimitra DSP/Github repo")
+```
+
+# Import and reorder data
+
+```{r import data, echo=F}
+#Module Eigengenes
+MEs <- read.csv("Data/WGCNA_Module_Eigengenes.csv", row.names = 1, check.names = F)
+
+#Abundance of deconvoluted cells
+abund <- read.csv("Data/cell_decon_abundance_estimates--Liver_HCA.csv", check.names = F, row.names = 1)
+
+#Relabelling and ordering the dfs for correlations
+colnames(abund) <- gsub("\\.", "", colnames(abund))
+colnames(MEs) <- gsub("\\.", "", colnames(MEs))
+abund <- abund[,colnames(MEs)]
+
+#Proportional abundance
+prop <- read.csv("Data/cell_decon_proportion_estimates--Liver_HCA.csv", check.names = F, row.names = 1)
+colnames(prop) <- gsub("\\.", "", colnames(prop))
+prop <- prop[,colnames(MEs)]
+
+#Meta data
+meta <- read.xlsx("Data/ROI annotations.xlsx", sheet = "ROI metadata")
+```
+
+# Correlate abundance with eigengenes
+
+```{r correlate abundance with eigengene expression, echo=F}
+#Colour palette
+coul <- colorRampPalette(c("blue", "white", "red"))
+
+correlation_results <- rcorr(t(abund), t(MEs), type = "spearman")   
+
+#To retreieve the p values: 
+corr_p <- correlation_results$P 
+corr_p <- corr_p[1:14,15:22] #matrix of p values
+corr_r <- correlation_results$r
+corr_r <- corr_r[1:14,15:22] #matrix of correlation values
+
+refined_corrplot_modvgene <- corrplot(corr_r, tl.col = "black", tl.srt = 45, col = coul(100), p.mat = corr_p, sig.level = 0.05, insig =  "label_sig", tl.cex = 0.8, pch.cex = 1.2, method = "color")
+```
+
+## PT2
+
+```{r PT2, echo=F}
+#Prepare proportional abundance data for plotting
+prop_mod <- prop
+prop_mod$Cell <- rownames(prop)
+prop_mod <- gather(prop_mod, key = "AOI", value = "Abundance", any_of(colnames(prop)))
+prop_mod <- prop_mod[grepl("PT2", prop_mod$AOI),]
+prop_mod <- prop_mod %>% mutate(AOI = factor(AOI, levels=unique(AOI)))
+annot <- subset(meta, Patient == "PT2")
+annot$SegmentDisplayName <- gsub("\\.", "", annot$SegmentDisplayName)
+annot <- annot %>% mutate(SegmentDisplayName = factor(SegmentDisplayName, levels=unique(SegmentDisplayName)))
+
+#Colour palette for stacked bar plot
+mycolors <- c("#fd7f6f", "#7eb0d5", "#b2e061", "#bd7ebe", "#ffb55a", "#ffee65", "#beb9db", "#fdcce5", "#8bd3c7", "#5E4FA2", "#FEF3ED", "#7BCAA9", "#FDD884", "#DCF199", "#3C7AB6")
+
+
+#Plotting the data
+stacked <- ggplot(prop_mod, aes(fill=Cell, x = AOI, y = Abundance)) +
+  geom_bar(position = "stack", stat = "identity", linewidth=0.2, col = "grey30") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.key.size = unit(.8, "lines"),
+    legend.position = "none"
+  ) +
+  ggtitle("PT2") +
+  scale_fill_manual(values = mycolors) +
+  ylab("Proportional Cell Abundance") +
+  scale_y_continuous(expand = c(0,0))
+
+
+HBV_bar <- ggplot(data=annot, aes(x = SegmentDisplayName, y = 1, fill = Numeric.Estimated.HBV)) +
+  geom_tile(col = "grey60") +
+  scale_fill_gradientn(colours = c("white","blue"),  limits=c(0,100), breaks=c(0,25,50,100)) +
+  #scale_fill_continuous(low = "white", high = "blue") +
+  theme(axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.title = element_blank(), 
+        plot.margin = margin(0, 0, 0, 0, "cm"), 
+        legend.position = "none", 
+        legend.key.size = unit(0.5, "cm"),
+        legend.direction = "horizontal") +
+  labs(fill="% HBV") +
+  coord_fixed(ratio=1) #changing the height of the plot
+
+
+Immune_bar <- ggplot(data=annot, aes(x = SegmentDisplayName, y = 1, fill = Numeric.Estimated.Immune)) +
+  geom_tile(col = "grey60") +
+  scale_fill_gradientn(colours = c("white","blue"),  limits=c(0,60), breaks=c(0,10,30,60)) +
+  theme(axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.title = element_blank(), 
+        plot.margin = margin(0, 0, 0, 0, "cm"), 
+        legend.position = "none", 
+        legend.key.size = unit(0.5, "cm"),
+        legend.direction = "horizontal") +
+  labs(fill="% Immune") +
+  coord_fixed(ratio=1) #changing the height of the plot
+
+stacked/HBV_bar/Immune_bar + plot_layout(guides = "collect")
+```
+
+## PT3
+
+```{r PT3, echo=F}
+#Prepare proportional abundance data for plotting
+prop_mod <- prop
+prop_mod$Cell <- rownames(prop)
+prop_mod <- gather(prop_mod, key = "AOI", value = "Abundance", any_of(colnames(prop)))
+prop_mod <- prop_mod[grepl("PT3", prop_mod$AOI),]
+prop_mod <- prop_mod %>% mutate(AOI = factor(AOI, levels=unique(AOI)))
+annot <- subset(meta, Patient == "PT3")
+annot$SegmentDisplayName <- gsub("\\.", "", annot$SegmentDisplayName)
+annot <- annot %>% mutate(SegmentDisplayName = factor(SegmentDisplayName, levels=unique(SegmentDisplayName)))
+
+#Plotting the data
+stacked <- ggplot(prop_mod, aes(fill=Cell, x = AOI, y = Abundance)) +
+  geom_bar(position = "stack", stat = "identity", linewidth=0.2, col = "grey30") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.key.size = unit(.8, "lines")
+  ) +
+  ggtitle("PT3") +
+  scale_fill_manual(values = mycolors) +
+  ylab("Proportional Cell Abundance") +
+  scale_y_continuous(expand = c(0,0))
+
+
+HBV_bar <- ggplot(data=annot, aes(x = SegmentDisplayName, y = 1, fill = Numeric.Estimated.HBV)) +
+  geom_tile(col = "grey60") +
+  scale_fill_gradientn(colours = c("white","blue"),  limits=c(0,100), breaks=c(0,25,50,100)) +
+  theme(axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.title = element_blank(), 
+        plot.margin = margin(0, 0, 0, 0, "cm"), 
+        legend.position = "right", 
+        legend.key.size = unit(0.5, "cm"),
+        legend.direction = "horizontal") +
+  labs(fill="% HBV") +
+  coord_fixed(ratio=1) #changing the height of the plot
+
+
+Immune_bar <- ggplot(data=annot, aes(x = SegmentDisplayName, y = 1, fill = Numeric.Estimated.Immune)) +
+  geom_tile(col = "grey60") +
+  scale_fill_gradientn(colours = c("white","blue"),  limits=c(0,60), breaks=c(0,10,30,60)) +
+  theme(axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.title = element_blank(), 
+        plot.margin = margin(0, 0, 0, 0, "cm"), 
+        legend.position = "right", 
+        legend.key.size = unit(0.5, "cm"),
+        legend.direction = "horizontal") +
+  labs(fill="% Immune") +
+  coord_fixed(ratio=1) #changing the height of the plot
+
+stacked/HBV_bar/Immune_bar + plot_layout(guides = "collect")
+```
+
+
+## PT1
+
+```{r PT1, echo=F}
+#Prepare proportional abundance data for plotting
+prop_mod <- prop
+prop_mod$Cell <- rownames(prop)
+prop_mod <- gather(prop_mod, key = "AOI", value = "Abundance", any_of(colnames(prop)))
+prop_mod <- prop_mod[grepl("PT1", prop_mod$AOI),]
+prop_mod <- prop_mod %>% mutate(AOI = factor(AOI, levels=unique(AOI)))
+annot <- subset(meta, Patient == "PT1")
+annot$SegmentDisplayName <- gsub("\\.", "", annot$SegmentDisplayName)
+annot <- annot %>% mutate(SegmentDisplayName = factor(SegmentDisplayName, levels=unique(SegmentDisplayName)))
+
+#Plotting the data
+stacked <- ggplot(prop_mod, aes(fill=Cell, x = AOI, y = Abundance)) +
+  geom_bar(position = "stack", stat = "identity", linewidth=0.2, col = "grey30") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "none",
+    legend.key.size = unit(.8, "lines")
+  ) +
+  ggtitle("PT1") +
+  scale_fill_manual(values = mycolors) +
+  ylab("Proportional Cell Abundance") +
+  scale_y_continuous(expand = c(0,0))
+
+
+HBV_bar <- ggplot(data=annot, aes(x = SegmentDisplayName, y = 1, fill = Numeric.Estimated.HBV)) +
+  geom_tile(col = "grey60") +
+  scale_fill_gradientn(colours = c("white","blue"),  limits=c(0,100), breaks=c(0,25,50,100)) +
+  theme(axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.title = element_blank(), 
+        plot.margin = margin(0, 0, 0, 0, "cm"), 
+        legend.position = "none", 
+        legend.key.size = unit(0.5, "cm"),
+        legend.direction = "horizontal") +
+  labs(fill="% HBV") +
+  coord_fixed(ratio=1) #changing the height of the plot
+
+
+Immune_bar <- ggplot(data=annot, aes(x = SegmentDisplayName, y = 1, fill = Numeric.Estimated.Immune)) +
+  geom_tile(col = "grey60") +
+  scale_fill_gradientn(colours = c("white","blue"),  limits=c(0,60), breaks=c(0,10,30,60)) +
+  theme(axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.title = element_blank(), 
+        plot.margin = margin(0, 0, 0, 0, "cm"), 
+        legend.position = "none", 
+        legend.key.size = unit(0.5, "cm"),
+        legend.direction = "horizontal") +
+  labs(fill="% Immune") +
+  coord_fixed(ratio=1) #changing the height of the plot
+
+stacked/HBV_bar/Immune_bar + plot_layout(guides = "collect")
+```
